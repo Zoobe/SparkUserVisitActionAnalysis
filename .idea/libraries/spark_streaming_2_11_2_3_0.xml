@@ -1,0 +1,9 @@
+<component name="libraryTable">
+  <library name="spark-streaming_2.11-2.3.0">
+    <CLASSES>
+      <root url="jar://$MAVEN_REPOSITORY$/org/apache/spark/spark-streaming_2.11/2.3.0/spark-streaming_2.11-2.3.0.jar!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>
