@@ -18,5 +18,13 @@ object DAOFactory {
 
   def getAdBlacklistDAO = new AdBlacklistDAOImpl
 
+  def getAdUserClickCountDAO = new AdUserClickCountDAOImpl
+
+  def getAdStatDAO = new AdStatDAOImpl
+
+  def getAdProvinceTop3DAO = new AdProvinceTop3DAOImpl
+
+  def getAdClickTrendDAO = new AdClickTrendDAOImpl
+
 
 }

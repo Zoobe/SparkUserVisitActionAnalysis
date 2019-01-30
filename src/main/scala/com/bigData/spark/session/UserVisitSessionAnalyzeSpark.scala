@@ -15,6 +15,159 @@ import org.apache.spark.util.AccumulatorV2
 
 object UserVisitSessionAnalyzeSpark {
 
+
+
+  def main(args: Array[String]): Unit = {
+    val local = ConfigurationManager.getBoolean(Constants.SPARK_LOCAL)
+
+    val spark = SparkSession.builder()
+      .appName(this.getClass.getSimpleName)
+      .master("local")
+//      .config()
+      .getOrCreate()
+
+    //如果为local模式就生成模拟数据
+    SparkUtils.mockData(spark)
+
+    // 从MySQL任务表中取出用户需要的任务
+    // 首先建立TaskDAO组件
+    val taskDAO = DAOFactory.getTaskDAO
+
+    val taskid = ParamUtils.getTaskIdFromArgs(args,Constants.SPARK_LOCAL_TASKID_SESSION)
+    val task = taskDAO.findById(taskid)
+
+    if(task==null){
+      println(new Date + s": cannot find this task with id [ $taskid  ].")
+      return
+    }
+
+    // 获得json格式的任务参数
+    val taskParam =JSON.parseObject(task.getTaskParam)
+
+    // 获得指定日期的数据RDD[Row]
+    val actionRDD = SparkUtils.getActionRDDByDateRange(spark,taskParam)
+    val sessionid2actionRDD = actionRDD.mapPartitions(iter=>(iter.map(x=>(x.getString(2),x))))
+    sessionid2actionRDD.persist(StorageLevel.MEMORY_ONLY)
+
+//    println(sessionid2actionRDD.first())
+    val sessionid2AggrInfoRDD = aggregateBySession(spark, sessionid2actionRDD)
+
+
+    val accumulator = new SessionAggrStatAccumulator
+    spark.sparkContext.register(accumulator,"SessionAggrStatAccumulator")
+
+    // 接着，就要针对session粒度的聚合数据，按照使用者指定的筛选参数进行数据过滤
+    // 并进行统计
+    val filteredSessionid2AggrInfoRDD = filterSessionAndAggrStat(
+      sessionid2AggrInfoRDD,
+      taskParam,accumulator)
+    println(filteredSessionid2AggrInfoRDD.count())
+    // sessionid2detailRDD，就是代表了通过筛选的session对应的访问明细数据
+    val sessionid2detailRDD = getSessionid2detailRDD(filteredSessionid2AggrInfoRDD, sessionid2actionRDD)
+
+//    sessionid2detailRDD.persist(StorageLevel.MEMORY_ONLY)
+
+    calculateAndPersistAggrStat(accumulator.value, task.getTaskid)
+
+    randomExtractSession(spark, task.getTaskid, filteredSessionid2AggrInfoRDD, sessionid2detailRDD)
+
+
+
+//    sessionid2detailRDD.take(1)
+    // 获取top10热门品类
+    val top10CategoryList = getTop10Category(task.getTaskid,sessionid2detailRDD)
+
+    // 获取top10活跃session
+    getTop10Session(spark, task.getTaskid, top10CategoryList, sessionid2detailRDD)
+
+    spark.stop()
+
+  }
+
+  def aggregateBySession(spark: SparkSession, sessionid2actionRDD: RDD[(String, Row)]) = {
+    // 对每一个session分组进行聚合，将session中所有的搜索词和点击品类都聚合起来
+    // 到此为止，获取的数据格式，如下：<userid,partAggrInfo(sessionid,searchKeywords,clickCategoryIds)>
+    val userid2PartAggrInfoRDD = sessionid2actionRDD.groupByKey().map{x=>
+      val sessionid = x._1
+      val searchKeywordsBuffer = new StringBuilder
+      val clickCategoryIdsBuffer = new StringBuilder
+      var stepLength = 0
+      var userid:Long = 0
+      var startTime:Date = null
+      var endTime:Date = null
+
+      x._2.foreach{row =>
+        if(userid==null) userid = row.getLong(1)
+        val searchKeyword = row.getString(5)
+        val clickCategoryId = row.getLong(6)
+        if(searchKeyword!=null && !searchKeywordsBuffer.contains(searchKeyword))
+          searchKeywordsBuffer.++=(searchKeyword+",")
+        if(clickCategoryId != -999L && !clickCategoryIdsBuffer.contains(clickCategoryId.toString))
+          clickCategoryIdsBuffer.++=(clickCategoryId + ",")
+
+        val actionTime = DateUtils.parseTime(row.getString(4))
+
+        if(startTime == null) {
+          startTime = actionTime
+        }
+        if(endTime == null) {
+          endTime = actionTime
+        }
+
+        if(actionTime.before(startTime)) {
+          startTime = actionTime
+        }
+        if(actionTime.after(endTime)) {
+          endTime = actionTime
+        }
+        stepLength += 1
+      }
+
+      val searchKeywords = StringUtils.trimChar(searchKeywordsBuffer.mkString,",")
+      val clickCategoryIds = StringUtils.trimChar(clickCategoryIdsBuffer.mkString,",")
+
+      val visitLength = (endTime.getTime() - startTime.getTime()) / 1000
+
+      val partAggrInfo = s"${Constants.FIELD_SESSION_ID}=$sessionid|" +
+        s"${Constants.FIELD_SEARCH_KEYWORDS}=$searchKeywords|" +
+        s"${Constants.FIELD_CLICK_CATEGORY_IDS}=$clickCategoryIds|" +
+        s"${Constants.FIELD_VISIT_LENGTH}=$visitLength|" +
+        s"${Constants.FIELD_STEP_LENGTH}=$stepLength|" +
+        s"${Constants.FIELD_START_TIME}=${DateUtils.formatTime(startTime)}"
+
+      (userid,partAggrInfo)
+    }
+
+    // 查询所有用户数据，并映射成<userid,Row>的格式
+    val sql = "select * from user_info"
+    val userid2InfoRDD = spark.sql(sql).rdd.map(x=>(x.getLong(0),x))
+
+    // 将session粒度聚合数据，与用户信息进行join
+    val userid2FullInfoRDD = userid2PartAggrInfoRDD.join(userid2InfoRDD)
+
+    // 对join起来的数据进行拼接，并且返回<sessionid,fullAggrInfo>格式的数据
+    val sessionid2FullAggrInfoRDD = userid2FullInfoRDD.map{x=>
+      val partAggrInfo = x._2._1
+      val userInfoRow = x._2._2
+
+      val sessionid = StringUtils.getFieldFromConcatString(partAggrInfo,
+        "\\|", Constants.FIELD_SESSION_ID)
+
+      val age = userInfoRow.getInt(3)
+      val professional = userInfoRow.getString(4)
+      val city = userInfoRow.getString(5)
+      val sex = userInfoRow.getString(6)
+
+      val fullAggrInfo = s"$partAggrInfo|${Constants.FIELD_AGE}=$age|" +
+        s"${Constants.FIELD_PROFESSIONAL}=$professional|"+
+        s"${Constants.FIELD_CITY}=$city|"+
+        s"${Constants.FIELD_SEX}=$sex"
+
+      (sessionid,fullAggrInfo)
+    }
+    sessionid2FullAggrInfoRDD
+  }
+
   def getSessionid2detailRDD(filteredSessionid2AggrInfoRDD:RDD[(String,String)],
                              sessionid2actionRDD:RDD[(String,Row)])={
     filteredSessionid2AggrInfoRDD.join(sessionid2actionRDD).map(x=>(x._1,x._2._2))
@@ -161,13 +314,13 @@ object UserVisitSessionAnalyzeSpark {
     // 访问过：指的是，点击过、下单过、支付过的品类
     val categoryidRDD = sessionid2detailRDD.flatMap(x=>{
       val row = x._2
-        val clickCategoryId = Option(row.getLong(6))
-        val orderCategoryIds = Option(row.getString(8))
-        val payCategoryIds = Option(row.getString(10))
-        List(clickCategoryId,orderCategoryIds,payCategoryIds).filter(t=>t.isDefined && t.get != -999).map(o=>{
-          val tup = o.get.toString.toLong
-          (tup,tup)
-        })
+      val clickCategoryId = Option(row.getLong(6))
+      val orderCategoryIds = Option(row.getString(8))
+      val payCategoryIds = Option(row.getString(10))
+      List(clickCategoryId,orderCategoryIds,payCategoryIds).filter(t=>t.isDefined && t.get != -999).map(o=>{
+        val tup = o.get.toString.toLong
+        (tup,tup)
+      })
     }).distinct()
 
     /**
@@ -363,8 +516,8 @@ object UserVisitSessionAnalyzeSpark {
     /**
       * 第三步：分组取TopN算法实现，获取每个品类的top10活跃用户
       */
-      // 因为join操作会将所有categoryid相同的rdd组合起来，所以返回的并不一定只有10个，
-      // 可能有相同key的好多rdd，故需要groupby操作将key聚合
+    // 因为join操作会将所有categoryid相同的rdd组合起来，所以返回的并不一定只有10个，
+    // 可能有相同key的好多rdd，故需要groupby操作将key聚合
     val top10CategorySessionCountsRDD = top10CategorySessionCountRDD.groupByKey
 
     val top10SessionRDD = top10CategorySessionCountsRDD.flatMap(x=>{
@@ -422,152 +575,6 @@ object UserVisitSessionAnalyzeSpark {
       val sessionDetailDAO = DAOFactory.getSessionDetailDAO
       sessionDetailDAO.insert(sessionDetail)
     })
-  }
-
-  def main(args: Array[String]): Unit = {
-    val local = ConfigurationManager.getBoolean(Constants.SPARK_LOCAL)
-
-    val spark = SparkSession.builder()
-      .appName(this.getClass.getSimpleName)
-      .master("local")
-//      .config()
-      .getOrCreate()
-
-    //如果为local模式就生成模拟数据
-    SparkUtils.mockData(spark)
-
-    // 从MySQL任务表中取出用户需要的任务
-    // 首先建立TaskDAO组件
-    val taskDAO = DAOFactory.getTaskDAO
-
-    val taskid = ParamUtils.getTaskIdFromArgs(args,Constants.SPARK_LOCAL_TASKID_SESSION)
-    val task = taskDAO.findById(taskid)
-
-    if(task==null){
-      println(new Date + s": cannot find this task with id [ $taskid  ].")
-      return
-    }
-
-    // 获得json格式的任务参数
-    val taskParam =JSON.parseObject(task.getTaskParam)
-
-    // 获得指定日期的数据RDD[Row]
-    val actionRDD = SparkUtils.getActionRDDByDateRange(spark,taskParam)
-    val sessionid2actionRDD = actionRDD.mapPartitions(iter=>(iter.map(x=>(x.getString(2),x))))
-    sessionid2actionRDD.persist(StorageLevel.MEMORY_ONLY)
-
-//    println(sessionid2actionRDD.first())
-
-    // 对每一个session分组进行聚合，将session中所有的搜索词和点击品类都聚合起来
-    // 到此为止，获取的数据格式，如下：<userid,partAggrInfo(sessionid,searchKeywords,clickCategoryIds)>
-    val userid2PartAggrInfoRDD = sessionid2actionRDD.groupByKey().map{x=>
-      val sessionid = x._1
-      val searchKeywordsBuffer = new StringBuilder
-      val clickCategoryIdsBuffer = new StringBuilder
-      var stepLength = 0
-      var userid:Long = 0
-      var startTime:Date = null
-      var endTime:Date = null
-
-      x._2.foreach{row =>
-        if(userid==null) userid = row.getLong(1)
-        val searchKeyword = row.getString(5)
-        val clickCategoryId = row.getLong(6)
-        if(searchKeyword!=null && !searchKeywordsBuffer.contains(searchKeyword))
-          searchKeywordsBuffer.++=(searchKeyword+",")
-        if(clickCategoryId != -999L && !clickCategoryIdsBuffer.contains(clickCategoryId.toString))
-          clickCategoryIdsBuffer.++=(clickCategoryId + ",")
-
-        val actionTime = DateUtils.parseTime(row.getString(4))
-
-        if(startTime == null) {
-          startTime = actionTime
-        }
-        if(endTime == null) {
-          endTime = actionTime
-        }
-
-        if(actionTime.before(startTime)) {
-          startTime = actionTime
-        }
-        if(actionTime.after(endTime)) {
-          endTime = actionTime
-        }
-        stepLength += 1
-      }
-
-      val searchKeywords = StringUtils.trimChar(searchKeywordsBuffer.mkString,",")
-      val clickCategoryIds = StringUtils.trimChar(clickCategoryIdsBuffer.mkString,",")
-
-      val visitLength = (endTime.getTime() - startTime.getTime()) / 1000
-
-      val partAggrInfo = s"${Constants.FIELD_SESSION_ID}=$sessionid|" +
-        s"${Constants.FIELD_SEARCH_KEYWORDS}=$searchKeywords|" +
-        s"${Constants.FIELD_CLICK_CATEGORY_IDS}=$clickCategoryIds|" +
-        s"${Constants.FIELD_VISIT_LENGTH}=$visitLength|" +
-        s"${Constants.FIELD_STEP_LENGTH}=$stepLength|" +
-        s"${Constants.FIELD_START_TIME}=${DateUtils.formatTime(startTime)}"
-
-      (userid,partAggrInfo)
-    }
-
-    // 查询所有用户数据，并映射成<userid,Row>的格式
-    val sql = "select * from user_info"
-    val userid2InfoRDD = spark.sql(sql).rdd.map(x=>(x.getLong(0),x))
-
-    // 将session粒度聚合数据，与用户信息进行join
-    val userid2FullInfoRDD = userid2PartAggrInfoRDD.join(userid2InfoRDD)
-
-    // 对join起来的数据进行拼接，并且返回<sessionid,fullAggrInfo>格式的数据
-    val sessionid2FullAggrInfoRDD = userid2FullInfoRDD.map{x=>
-      val partAggrInfo = x._2._1
-      val userInfoRow = x._2._2
-
-      val sessionid = StringUtils.getFieldFromConcatString(partAggrInfo,
-        "\\|", Constants.FIELD_SESSION_ID)
-
-      val age = userInfoRow.getInt(3)
-      val professional = userInfoRow.getString(4)
-      val city = userInfoRow.getString(5)
-      val sex = userInfoRow.getString(6)
-
-      val fullAggrInfo = s"$partAggrInfo|${Constants.FIELD_AGE}=$age|" +
-        s"${Constants.FIELD_PROFESSIONAL}=$professional|"+
-        s"${Constants.FIELD_CITY}=$city|"+
-        s"${Constants.FIELD_SEX}=$sex"
-
-      (sessionid,fullAggrInfo)
-    }
-
-    val accumulator = new SessionAggrStatAccumulator
-    spark.sparkContext.register(accumulator,"SessionAggrStatAccumulator")
-
-    // 接着，就要针对session粒度的聚合数据，按照使用者指定的筛选参数进行数据过滤
-    // 并进行统计
-    val filteredSessionid2AggrInfoRDD = filterSessionAndAggrStat(
-      sessionid2FullAggrInfoRDD,
-      taskParam,accumulator)
-    println(filteredSessionid2AggrInfoRDD.count())
-    // sessionid2detailRDD，就是代表了通过筛选的session对应的访问明细数据
-    val sessionid2detailRDD = getSessionid2detailRDD(filteredSessionid2AggrInfoRDD, sessionid2actionRDD)
-
-//    sessionid2detailRDD.persist(StorageLevel.MEMORY_ONLY)
-
-    calculateAndPersistAggrStat(accumulator.value, task.getTaskid)
-
-    randomExtractSession(spark, task.getTaskid, filteredSessionid2AggrInfoRDD, sessionid2detailRDD)
-
-
-
-//    sessionid2detailRDD.take(1)
-    // 获取top10热门品类
-    val top10CategoryList = getTop10Category(task.getTaskid,sessionid2detailRDD)
-
-    // 获取top10活跃session
-    getTop10Session(spark, task.getTaskid, top10CategoryList, sessionid2detailRDD)
-
-    spark.stop()
-
   }
 
   def randomExtractSession(spark:SparkSession,
